@@ -67,11 +67,24 @@ class InputParsingTests(unittest.TestCase):
 
     def test_model_name_replaces_every_non_allowed_character(self):
         self.assertEqual(
-            app.sanitize_model_name("/models/Qwen 2.5-7B_instruct"),
+            app.sanitize_model_name("Qwen 2.5-7B_instruct"),
             "Qwen-2-5-7B_instruct",
         )
+        self.assertEqual(
+            app.sanitize_model_name("Qwen/Qwen2.5-7B"),
+            "Qwen-Qwen2-5-7B",
+        )
         with self.assertRaises(app.ConfigError):
-            app.sanitize_model_name("/models/模型")
+            app.sanitize_model_name("模型")
+
+    def test_served_model_name_must_not_be_blank(self):
+        self.assertEqual(
+            app.parse_served_model_name("  qwen2.5-7b  "), "qwen2.5-7b"
+        )
+        for blank in ("", "   "):
+            with self.subTest(blank=blank):
+                with self.assertRaises(app.ConfigError):
+                    app.parse_served_model_name(blank)
 
     def test_model_path_must_be_existing_absolute_path(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -114,11 +127,11 @@ class InputParsingTests(unittest.TestCase):
         )
 
 
-def make_config(temp_dir, model_path="/models/Qwen 7B", served_model_name=None):
+def make_config(temp_dir, model_path="/models/Qwen 7B", served_model_name="Qwen-7B"):
     return app.EvalConfig(
         endpoint=app.parse_service_url("http://127.0.0.1:8000"),
         model_path=model_path,
-        model_name=app.sanitize_model_name(model_path),
+        model_name=app.sanitize_model_name(served_model_name),
         result_dir=Path(temp_dir).resolve(),
         target_speed=10,
         input_lengths=(128,),
@@ -221,6 +234,7 @@ class ResultStorageTests(unittest.TestCase):
                 input_lengths=(128,),
                 output_lengths=(8,),
                 concurrencies=(1,),
+                served_model_name=first_config.served_model_name,
             )
             with self.assertRaises(app.ConfigError):
                 app.ResultStore(second_config).validate_existing()
@@ -922,7 +936,7 @@ class CliAndPromptTests(unittest.TestCase):
                 input_lengths="",
                 output_lengths="",
                 concurrencies="",
-                served_model_name="",
+                served_model_name="Qwen-7B",
                 today=date(2026, 11, 22),
             )
 
@@ -931,11 +945,29 @@ class CliAndPromptTests(unittest.TestCase):
             self.assertEqual(config.output_lengths, app.DEFAULT_OUTPUT_LENGTHS)
             self.assertEqual(config.concurrencies, app.DEFAULT_CONCURRENCIES)
             self.assertEqual(config.model_name, "Qwen-7B")
-            self.assertIsNone(config.served_model_name)
+            self.assertEqual(config.served_model_name, "Qwen-7B")
             self.assertEqual(
                 config.result_dir,
                 Path("/data/model_eval_result/20261122/Qwen-7B").resolve(),
             )
+
+    def test_build_eval_config_requires_served_model_name(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_dir = Path(temp_dir) / "Qwen 7B"
+            model_dir.mkdir()
+
+            with self.assertRaises(app.ConfigError):
+                app.build_eval_config(
+                    service_url="http://127.0.0.1:8000",
+                    model_path=os.fspath(model_dir),
+                    result_dir="",
+                    target_speed="",
+                    input_lengths="",
+                    output_lengths="",
+                    concurrencies="",
+                    served_model_name="   ",
+                    today=date(2026, 11, 22),
+                )
 
     def test_build_eval_config_keeps_served_model_name_override(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -954,8 +986,12 @@ class CliAndPromptTests(unittest.TestCase):
                 today=date(2026, 11, 22),
             )
 
-            self.assertEqual(config.model_name, "Qwen-7B")
             self.assertEqual(config.served_model_name, "served-qwen")
+            self.assertEqual(config.model_name, "served-qwen")
+            self.assertEqual(
+                config.result_dir,
+                Path("/data/model_eval_result/20261122/served-qwen").resolve(),
+            )
 
     def test_prompt_reprompts_after_invalid_value_and_collects_eight_fields(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -987,6 +1023,7 @@ class CliAndPromptTests(unittest.TestCase):
             self.assertEqual(config.output_lengths, (8, 16))
             self.assertEqual(config.concurrencies, (1, 2))
             self.assertEqual(config.served_model_name, "served-qwen")
+            self.assertEqual(config.model_name, "served-qwen")
             self.assertIn("必须是正整数", output.getvalue())
 
     def test_prompt_eof_raises_config_error_instead_of_looping(self):

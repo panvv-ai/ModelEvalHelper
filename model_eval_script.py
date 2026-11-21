@@ -78,8 +78,8 @@ class BenchmarkCase:
 class EvalConfig:
     """一次批量压测运行所需的完整配置。
 
-    ``served_model_name`` 非空时作为 ``--model`` 传给 vLLM；为空时使用
-    由模型路径最后一级生成的 ``model_name``。
+    ``served_model_name`` 是必填的服务端模型名，原值作为 ``--model`` 传给
+    vLLM；``model_name`` 由其规范化得到，仅用于 CSV 文件名和默认结果目录。
     """
 
     endpoint: ServiceEndpoint
@@ -90,7 +90,7 @@ class EvalConfig:
     input_lengths: Tuple[int, ...]
     output_lengths: Tuple[int, ...]
     concurrencies: Tuple[int, ...]
-    served_model_name: Optional[str] = None
+    served_model_name: str
 
     @property
     def csv_path(self) -> Path:
@@ -446,7 +446,7 @@ def build_vllm_command(
         "--port",
         str(config.endpoint.port),
         "--model",
-        config.served_model_name or config.model_name,
+        config.served_model_name,
         "--tokenizer",
         config.model_path,
         "--dataset-name",
@@ -980,19 +980,29 @@ def parse_service_url(service_url: str) -> ServiceEndpoint:
     return ServiceEndpoint(host=host, port=port, base_url=base_url)
 
 
-def sanitize_model_name(model_path: str) -> str:
-    """从模型路径最后一级生成可用于 CSV 文件名和 --model 的名称。
+def sanitize_model_name(served_model_name: str) -> str:
+    """把服务端模型名规范化为可用于 CSV 文件名和目录名的名称。
 
     仅保留 ASCII 字母、数字、下划线和连字符；其他连续字符替换为一个
     连字符，并移除首尾连字符。规范化后为空时拒绝执行。
     """
 
-    basename = Path(model_path).name
-    name = re.sub(r"[^A-Za-z0-9_-]+", "-", basename).strip("-")
+    name = re.sub(r"[^A-Za-z0-9_-]+", "-", served_model_name).strip("-")
     if not name:
         raise ConfigError(
-            "无法从模型文件路径生成合法模型名；最后一级至少需要一个 "
-            "英文字母、数字、下划线或连字符"
+            "服务端模型名无法生成合法文件名；至少需要一个英文字母、数字、"
+            "下划线或连字符"
+        )
+    return name
+
+
+def parse_served_model_name(value: str) -> str:
+    """校验服务端模型名必填，返回去除首尾空白后的原值。"""
+
+    name = value.strip()
+    if not name:
+        raise ConfigError(
+            "服务端模型名不能为空；请填写服务端 --served-model-name 的值"
         )
     return name
 
@@ -1038,14 +1048,15 @@ def build_eval_config(
     input_lengths: str,
     output_lengths: str,
     concurrencies: str,
-    served_model_name: str = "",
+    served_model_name: str,
     today: Optional[date] = None,
 ) -> EvalConfig:
     """校验八项原始输入并构造不可变运行配置。"""
 
     endpoint = parse_service_url(service_url)
     normalized_model_path = validate_model_path(model_path)
-    model_name = sanitize_model_name(normalized_model_path)
+    normalized_served_name = parse_served_model_name(served_model_name)
+    model_name = sanitize_model_name(normalized_served_name)
     parsed_target = (
         parse_positive_int(target_speed, "目标速度")
         if target_speed.strip()
@@ -1072,7 +1083,7 @@ def build_eval_config(
         input_lengths=parsed_inputs,
         output_lengths=parsed_outputs,
         concurrencies=parsed_concurrencies,
-        served_model_name=served_model_name.strip() or None,
+        served_model_name=normalized_served_name,
     )
 
 
@@ -1128,8 +1139,8 @@ def prompt_for_config(
     )
     served_model_name = _read_with_retry(
         reader,
-        "[3/8] 服务端模型名（可留空，默认使用模型文件路径最后一级的名称）：",
-        lambda value: value.strip(),
+        "[3/8] 服务端模型名（必填，如 qwen2.5-7b-instruct）：",
+        parse_served_model_name,
         stream,
     )
     result_dir = _read_with_retry(
@@ -1176,7 +1187,7 @@ def prompt_for_config(
         stream,
     )
 
-    model_name = sanitize_model_name(model_path)
+    model_name = sanitize_model_name(served_model_name)
     return EvalConfig(
         endpoint=service_url,
         model_path=model_path,
@@ -1186,7 +1197,7 @@ def prompt_for_config(
         input_lengths=input_lengths,
         output_lengths=output_lengths,
         concurrencies=concurrencies,
-        served_model_name=served_model_name or None,
+        served_model_name=served_model_name,
     )
 
 
@@ -1202,8 +1213,8 @@ def _help_text() -> str:
 八项交互参数：
   1. 模型服务地址：必填，格式 http://host[:port]，不能带路径或认证信息。
   2. 模型文件路径：必填，必须是有 / 开头的本机绝对路径且真实存在。
-  3. 服务端模型名：可留空；非空时作为 --model 传给 vLLM，留空时使用
-     模型文件路径最后一级规范化后的名称。
+  3. 服务端模型名：必填，原值作为 --model 传给 vLLM；规范化后用于
+     CSV 文件名和默认结果目录。
   4. 结果目录：可留空；默认
      /data/model_eval_result/<今日日期YYYYMMDD>/<模型名>/
   5. 目标速度：正整数 tokens/s，默认 {DEFAULT_TARGET_SPEED}。
@@ -1217,7 +1228,7 @@ def _help_text() -> str:
 输出契约：
   - <结果目录>/<模型名>.csv：追加式结构化汇总，绝不覆盖已有结果。
   - <结果目录>/<模型名>.vllm_raw.jsonl：追加式 vLLM 原始明细。
-  - 模型名取路径最后一级，只保留字母、数字、下划线和连字符。
+  - 模型名取服务端模型名，只保留字母、数字、下划线和连字符。
   - 所有历史 SUCCESS 记录按本次目标速度重新判断达标情况；仅统计与本次
     服务地址相同的历史记录，其他地址的记录会提示后排除。
 
@@ -1238,7 +1249,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     八项交互参数及默认值：
         1. 模型服务地址：必填，http://host[:port]。
         2. 模型文件路径：必填，存在的本机绝对路径。
-        3. 服务端模型名：可留空，默认取模型文件路径最后一级。
+        3. 服务端模型名：必填，如 qwen2.5-7b-instruct。
         4. 结果目录：可留空，默认按日期和模型名生成。
         5. 目标速度：可留空，默认 10 tokens/s。
         6. 输入长度列表：可留空，默认 2048,8192,65536,120000,258000。
