@@ -13,7 +13,7 @@
 
 | 参数 | 规则 | 默认值 |
 |---|---|---|
-| 模型服务地址 | 必填，支持 `http://host[:port]` 或末尾 `/`；拒绝路径、查询串、认证信息和 HTTPS；端口缺省 80，端口 0 视为非法 | 无 |
+| 模型服务地址 | 必填，仅要求以 `http://` 或 `https://` 开头；原值作为 `--base-url` 传给 vLLM，其余格式不做校验，可访问性由用户保证 | 无 |
 | 模型文件路径 | 必填，必须以 `/` 开头且真实存在；允许文件或目录；规范化后的绝对路径传给 `--tokenizer` | 无 |
 | 服务端模型名 | 必填，不能为空；原值作为 `--model` 传给 vLLM；规范化后用于 CSV 文件名和默认结果目录 | 无 |
 | 结果目录 | 非必填；不存在时递归创建；已存在但不是目录则拒绝 | `/data/model_eval_result/<YYYYMMDD>/<模型名>/` |
@@ -34,7 +34,7 @@
 - 在 `model_eval_script.py` 中定义 `EvalConfig`、`BenchmarkCase`、`BenchmarkRecord`、`ResultStore`、`VllmRunner` 和汇总逻辑；关键函数与类全部提供详细中文 docstring，主函数开头写明八参数用法和 help 模式。
 - 所有输入在首个压测命令前完成校验；同时检查 `vllm` 可执行文件存在。根据用户选择，不对服务执行预检请求，由第一组压测自然暴露连接错误。
 - 使用参数数组和 `subprocess.Popen(..., shell=False)` 执行命令并实时转发输出；支持 Ctrl+C 终止子进程、将当前组合标记为 `INTERRUPTED`、打印已有历史总结并返回 130。
-- 每组命令固定包含 `--seed 42`、`--dataset-name random`、`--endpoint /v1/chat/completions`、`--backend openai-chat`，`--model` 使用服务端模型名原值，`--tokenizer` 使用模型文件绝对路径，且 `--num-prompts` 与 `--max-concurrency` 均等于当前并发数。
+- 每组命令以 `--base-url <模型服务地址原值>` 指定服务，并固定包含 `--seed 42`、`--dataset-name random`、`--endpoint /v1/chat/completions`、`--backend openai-chat`，`--model` 使用服务端模型名原值，`--tokenizer` 使用模型文件绝对路径，且 `--num-prompts` 与 `--max-concurrency` 均等于当前并发数。
 - 为避免 vLLM 辅助文件覆盖历史结果，每组先写入 `<结果目录>/.vllm_tmp/<run_id>-<输入>_<输出>_<并发>_<随机段>/` 下的唯一 JSON；解析成功后追加到规范 JSONL，随后只清理本次临时目录。规范 CSV 和 JSONL 始终采用追加写入并立即刷新。
 - 组合完整成功定义为 `completed == concurrency` 且 `failed == 0`；仅有部分请求成功时标为 `PARTIAL`，命令失败、无结果文件、JSON 无法解析或缺少必需指标时标为 `FAILED`。
 - 从 vLLM JSON 提取 `output_throughput`、`mean_ttft_ms`、`mean_tpot_ms`、`duration`、`completed` 和 `failed`。其中 `output_throughput` 为必需指标，缺失或非法时整组记为 `FAILED`；`mean_ttft_ms`、`mean_tpot_ms` 和 `duration` 为可选指标，缺失时以空值记录，不影响状态判定。
@@ -55,7 +55,7 @@
 
 ## 测试与验收
 
-- 在 `tests/test_model_eval_script.py` 中使用标准库 `unittest` 覆盖 URL（含端口 0、HTTPS、认证信息、路径和查询串）、模型路径、服务端模型名必填、默认值、ASCII 正整数、混合分隔符、去重和模型名规范化。
+- 在 `tests/test_model_eval_script.py` 中使用标准库 `unittest` 覆盖 URL 必填与 `http://`/`https://` 前缀（无端口、HTTPS、带路径或查询串均原样接受）、模型路径、服务端模型名必填、默认值、ASCII 正整数、混合分隔符、去重和模型名规范化。
 - 验证命令参数完整、组合顺序正确、无 shell 拼接，以及默认 `5 × 1 × 6 = 30` 个组合。
 - 使用临时目录和模拟 vLLM 结果验证 JSONL/CSV 连续追加、表头只写一次、原有内容不丢失、失败组合仍记录、单组失败后继续执行。
 - 覆盖必需指标缺失判 `FAILED`、可选指标缺失仍为 `SUCCESS`、最新成功记录去重、当前目标速度重判、每个输入/输出对最大并发、跨输出长度公共并发、无达标结论及数据不完整提示。
@@ -66,7 +66,8 @@
 ## 明确假设
 
 - 目标服务器使用 POSIX 路径和本地时区；日期目录在脚本启动时计算一次。
-- 服务仅提供无需认证的 HTTP vLLM OpenAI 兼容接口，服务发现和 token 管理不在本次范围内。
+- 服务仅提供无需认证的 HTTP/HTTPS vLLM OpenAI 兼容接口，服务发现和 token 管理不在本次范围内；脚本只校验地址前缀，可访问性由用户保证。
+- vLLM `bench serve` 支持 `--base-url` 参数；不支持时以清晰的失败信息记录。
 - vLLM 版本支持需求中给出的 `bench serve` 参数和 JSON 指标字段；不支持时以清晰的失败信息记录，不通过解析自由文本日志猜测指标。
 - 服务端模型名由用户提供且与服务端 `--served-model-name` 一致；同一模型名规范化后对应同一组结果文件。
 - 同一模型的默认日期目录每天独立；选择“全部历史记录”是指汇总当前解析后的该模型 CSV 内全部记录。

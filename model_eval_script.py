@@ -17,7 +17,6 @@ from datetime import date, datetime
 from itertools import product
 from pathlib import Path
 from typing import Optional, Sequence, TextIO, Tuple
-from urllib.parse import urlsplit
 
 
 DEFAULT_TARGET_SPEED = 10
@@ -58,10 +57,8 @@ class BenchmarkExecutionError(RuntimeError):
 
 @dataclass(frozen=True)
 class ServiceEndpoint:
-    """经过校验的 HTTP 服务地址。"""
+    """用户提供的模型服务地址，原值传给 vLLM 的 ``--base-url``。"""
 
-    host: str
-    port: int
     base_url: str
 
 
@@ -441,10 +438,8 @@ def build_vllm_command(
         executable,
         "bench",
         "serve",
-        "--host",
-        config.endpoint.host,
-        "--port",
-        str(config.endpoint.port),
+        "--base-url",
+        config.endpoint.base_url,
         "--model",
         config.served_model_name,
         "--tokenizer",
@@ -943,41 +938,22 @@ def parse_positive_int_list(
 
 
 def parse_service_url(service_url: str) -> ServiceEndpoint:
-    """校验并规范化 vLLM HTTP 服务地址。
+    """校验模型服务地址必填，且以 ``http://`` 或 ``https://`` 开头。
 
-    仅接受 ``http://host[:port]`` 或带末尾斜杠的形式。端口缺省为 80。
-    由于压测 endpoint 固定为 ``/v1/chat/completions``，服务地址本身不能
-    携带业务路径、查询参数、片段、认证信息或 HTTPS。
+    除必填和前缀外不做任何格式校验；地址原值（去除首尾空白）直接作为
+    ``--base-url`` 传给 vLLM，可访问性由用户保证。
     """
 
     raw = service_url.strip()
     if not raw:
         raise ConfigError("模型服务地址不能为空")
+    lowered = raw.lower()
+    if not (
+        lowered.startswith("http://") or lowered.startswith("https://")
+    ):
+        raise ConfigError("模型服务地址必须以 http:// 或 https:// 开头")
 
-    parsed = urlsplit(raw)
-    if parsed.scheme.lower() != "http":
-        raise ConfigError("模型服务地址必须以 http:// 开头")
-    if parsed.username is not None or parsed.password is not None:
-        raise ConfigError("模型服务地址不能包含用户名或密码")
-    if parsed.query or parsed.fragment:
-        raise ConfigError("模型服务地址不能包含查询参数或片段")
-    if parsed.path not in ("", "/"):
-        raise ConfigError("模型服务地址不能包含路径；endpoint 将由脚本固定指定")
-
-    try:
-        host = parsed.hostname
-        port = 80 if parsed.port is None else parsed.port
-    except ValueError as exc:
-        raise ConfigError(f"模型服务地址的端口不合法：{exc}") from exc
-
-    if not host:
-        raise ConfigError("模型服务地址缺少主机名")
-    if not 1 <= port <= 65535:
-        raise ConfigError("模型服务端口必须在 1 到 65535 之间")
-
-    display_host = f"[{host}]" if ":" in host else host
-    base_url = f"http://{display_host}:{port}"
-    return ServiceEndpoint(host=host, port=port, base_url=base_url)
+    return ServiceEndpoint(base_url=raw)
 
 
 def sanitize_model_name(served_model_name: str) -> str:
@@ -1211,7 +1187,8 @@ def _help_text() -> str:
   python3 model_eval_script.py --help
 
 八项交互参数：
-  1. 模型服务地址：必填，格式 http://host[:port]，不能带路径或认证信息。
+  1. 模型服务地址：必填，以 http:// 或 https:// 开头；原值作为
+     --base-url 传给 vLLM，其余格式不做校验。
   2. 模型文件路径：必填，必须是有 / 开头的本机绝对路径且真实存在。
   3. 服务端模型名：必填，原值作为 --model 传给 vLLM；规范化后用于
      CSV 文件名和默认结果目录。
@@ -1247,7 +1224,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         python3 model_eval_script.py --help
 
     八项交互参数及默认值：
-        1. 模型服务地址：必填，http://host[:port]。
+        1. 模型服务地址：必填，http:// 或 https:// 开头的可访问地址。
         2. 模型文件路径：必填，存在的本机绝对路径。
         3. 服务端模型名：必填，如 qwen2.5-7b-instruct。
         4. 结果目录：可留空，默认按日期和模型名生成。

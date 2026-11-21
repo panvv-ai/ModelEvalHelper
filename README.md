@@ -9,7 +9,8 @@
 - Python 3.9 或更高版本。
 - 已安装 vLLM，终端中可直接执行 `vllm bench serve --help`。
 - 模型服务无需 token 或 cookie。
-- 服务提供 `POST /v1/chat/completions`，地址格式为 `http://host[:port]`。
+- 服务提供 `POST /v1/chat/completions`，地址为 `http://` 或 `https://`
+  开头的可访问 URL。
 
 脚本只使用 Python 标准库，不需要额外安装 Python 依赖。
 
@@ -31,7 +32,7 @@ python3 model_eval_script.py
 
 | 参数 | 规则 | 默认值 |
 |---|---|---|
-| 模型服务地址 | `http://host[:port]`，不能带路径、认证信息或 HTTPS | 无 |
+| 模型服务地址 | 必填，`http://` 或 `https://` 开头；原值作为 `--base-url`，其余不做校验 | 无 |
 | 模型文件路径 | 本机绝对路径，必须以 `/` 开头且真实存在 | 无 |
 | 服务端模型名 | 必填；原值作为 `--model` 传给 vLLM，规范化后用于文件名和默认目录 | 无 |
 | 结果目录 | 不存在时自动递归创建 | `/data/model_eval_result/YYYYMMDD/<模型名>/` |

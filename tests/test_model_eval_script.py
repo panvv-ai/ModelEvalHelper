@@ -43,24 +43,21 @@ class InputParsingTests(unittest.TestCase):
                         invalid, app.DEFAULT_CONCURRENCIES, "并发数"
                     )
 
-    def test_service_url_normalizes_http_endpoint(self):
-        endpoint = app.parse_service_url("http://127.0.0.1:8000/")
-        self.assertEqual(endpoint.host, "127.0.0.1")
-        self.assertEqual(endpoint.port, 8000)
-        self.assertEqual(endpoint.base_url, "http://127.0.0.1:8000")
-        self.assertEqual(app.parse_service_url("http://127.0.0.1").port, 80)
-
-    def test_service_url_rejects_unsupported_or_ambiguous_forms(self):
-        invalid_urls = (
-            "127.0.0.1:8000",
-            "https://127.0.0.1:8000",
-            "http://user:pass@127.0.0.1:8000",
-            "http://127.0.0.1:8000/v1",
-            "http://127.0.0.1:8000?x=1",
+    def test_service_url_requires_only_http_prefix(self):
+        for url in (
+            "http://127.0.0.1",
+            "http://127.0.0.1:8000/",
+            "https://example.com:8443",
+            "https://user:pass@example.com/path?x=1",
             "http://127.0.0.1:0",
-            "http://127.0.0.1:70000",
-        )
-        for invalid in invalid_urls:
+        ):
+            with self.subTest(url=url):
+                self.assertEqual(
+                    app.parse_service_url(f"  {url}  ").base_url, url
+                )
+
+    def test_service_url_rejects_blank_or_other_scheme(self):
+        for invalid in ("", "   ", "127.0.0.1:8000", "ftp://127.0.0.1"):
             with self.subTest(invalid=invalid):
                 with self.assertRaises(app.ConfigError):
                     app.parse_service_url(invalid)
@@ -351,10 +348,8 @@ class VllmCommandAndRecordTests(unittest.TestCase):
                 command[2:],
                 [
                     "serve",
-                    "--host",
-                    "127.0.0.1",
-                    "--port",
-                    "8000",
+                    "--base-url",
+                    "http://127.0.0.1:8000",
                     "--model",
                     "Qwen-7B",
                     "--tokenizer",
