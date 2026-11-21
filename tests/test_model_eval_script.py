@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 from datetime import date
 from pathlib import Path
 
@@ -15,7 +16,7 @@ import model_eval_script as app
 class InputParsingTests(unittest.TestCase):
     def test_positive_int_rejects_zero_and_float(self):
         self.assertEqual(app.parse_positive_int(" 12 ", "目标速度"), 12)
-        for invalid in ("0", "-1", "1.5", "abc", ""):
+        for invalid in ("0", "-1", "1.5", "abc", "", "²", "１２３"):
             with self.subTest(invalid=invalid):
                 with self.assertRaises(app.ConfigError):
                     app.parse_positive_int(invalid, "目标速度")
@@ -47,6 +48,7 @@ class InputParsingTests(unittest.TestCase):
         self.assertEqual(endpoint.host, "127.0.0.1")
         self.assertEqual(endpoint.port, 8000)
         self.assertEqual(endpoint.base_url, "http://127.0.0.1:8000")
+        self.assertEqual(app.parse_service_url("http://127.0.0.1").port, 80)
 
     def test_service_url_rejects_unsupported_or_ambiguous_forms(self):
         invalid_urls = (
@@ -55,6 +57,7 @@ class InputParsingTests(unittest.TestCase):
             "http://user:pass@127.0.0.1:8000",
             "http://127.0.0.1:8000/v1",
             "http://127.0.0.1:8000?x=1",
+            "http://127.0.0.1:0",
             "http://127.0.0.1:70000",
         )
         for invalid in invalid_urls:
@@ -111,7 +114,7 @@ class InputParsingTests(unittest.TestCase):
         )
 
 
-def make_config(temp_dir, model_path="/models/Qwen 7B"):
+def make_config(temp_dir, model_path="/models/Qwen 7B", served_model_name=None):
     return app.EvalConfig(
         endpoint=app.parse_service_url("http://127.0.0.1:8000"),
         model_path=model_path,
@@ -121,6 +124,7 @@ def make_config(temp_dir, model_path="/models/Qwen 7B"):
         input_lengths=(128,),
         output_lengths=(8,),
         concurrencies=(1, 2),
+        served_model_name=served_model_name,
     )
 
 
@@ -241,6 +245,46 @@ class ResultStorageTests(unittest.TestCase):
             self.assertEqual(rows[0].output_throughput_tok_s, 13.25)
             self.assertEqual(rows[1].failed, 1)
 
+    def test_load_records_skips_dirty_rows_without_failing(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = make_config(temp_dir)
+            store = app.ResultStore(config)
+            store.append_record(make_record())
+
+            truncated = ",".join(
+                ["run-bad", "2026-11-22T10:00:00+08:00", "http://127.0.0.1:8000"]
+                + [config.model_path, "10"]
+            )
+            with config.csv_path.open("a", encoding="utf-8", newline="") as handle:
+                handle.write("\n\n")
+                handle.write(truncated + "\n")
+
+            stream = io.StringIO()
+            rows = store.load_records(output_stream=stream)
+
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0].status, "SUCCESS")
+            output = stream.getvalue()
+            self.assertIn("跳过无法解析的历史 CSV 行", output)
+            self.assertIn("已跳过 1 行", output)
+
+    def test_dirty_history_does_not_block_validation_or_analysis(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = make_config(temp_dir)
+            store = app.ResultStore(config)
+            store.append_record(make_record(concurrency=1, throughput=20.0))
+            with config.csv_path.open("a", encoding="utf-8", newline="") as handle:
+                handle.write("run-bad,only,three\n")
+
+            store.validate_existing()
+            rows = store.load_records()
+            analysis = app.analyze_history(
+                rows, target_speed=10, service_url=config.endpoint.base_url
+            )
+
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(analysis[0].pairs[0].max_concurrency, 1)
+
 
 def make_vllm_payload(completed=2, failed=0):
     return {
@@ -347,6 +391,28 @@ class VllmCommandAndRecordTests(unittest.TestCase):
             self.assertEqual(record.mean_tpot_ms, 4.0)
             self.assertEqual(record.duration_s, 3.25)
 
+    def test_missing_optional_metrics_keep_record_successful(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = make_config(temp_dir)
+            case = app.BenchmarkCase(input_len=128, output_len=8, concurrency=2)
+            payload = make_vllm_payload()
+            for field in ("mean_ttft_ms", "mean_tpot_ms", "duration"):
+                del payload[field]
+
+            record = app.make_record_from_result(
+                payload,
+                config,
+                case,
+                run_id="run-1",
+                timestamp="2026-11-22T10:00:00+08:00",
+            )
+
+            self.assertEqual(record.status, "SUCCESS")
+            self.assertEqual(record.output_throughput_tok_s, 4.923)
+            self.assertIsNone(record.mean_ttft_ms)
+            self.assertIsNone(record.mean_tpot_ms)
+            self.assertIsNone(record.duration_s)
+
     def test_incomplete_requests_are_partial_and_excluded_by_status(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             config = make_config(temp_dir)
@@ -383,6 +449,21 @@ class VllmCommandAndRecordTests(unittest.TestCase):
             self.assertIsNone(record.output_throughput_tok_s)
             self.assertIn("output_throughput", record.error)
 
+    def test_vllm_command_uses_served_model_name_override(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = make_config(temp_dir, served_model_name="served-qwen")
+            case = app.BenchmarkCase(input_len=128, output_len=8, concurrency=2)
+            result_path = Path(temp_dir) / ".vllm_tmp" / "case.json"
+
+            command = app.build_vllm_command(config, case, result_path)
+
+            self.assertEqual(
+                command[command.index("--model") + 1], "served-qwen"
+            )
+            self.assertEqual(
+                command[command.index("--tokenizer") + 1], config.model_path
+            )
+
 
 def history_record(
     *,
@@ -392,11 +473,12 @@ def history_record(
     throughput,
     status="SUCCESS",
     recorded_target=100,
+    service_url="http://127.0.0.1:8000",
 ):
     return app.BenchmarkRecord(
         run_id=f"run-{input_len}-{output_len}-{concurrency}-{throughput}",
         timestamp="2026-11-22T10:00:00+08:00",
-        service_url="http://127.0.0.1:8000",
+        service_url=service_url,
         model_name="Qwen-7B",
         model_path="/models/Qwen 7B",
         target_tokens_per_sec=recorded_target,
@@ -528,6 +610,79 @@ class HistoricalAnalysisTests(unittest.TestCase):
         self.assertIn("输出长度=8", text)
         self.assertIn("无并发达到目标速度", text)
         self.assertIn("没有任何历史成功记录", text)
+
+    def test_analysis_is_scoped_to_current_service_url(self):
+        history = (
+            history_record(
+                input_len=128,
+                output_len=8,
+                concurrency=1,
+                throughput=100.0,
+            ),
+            history_record(
+                input_len=128,
+                output_len=8,
+                concurrency=2,
+                throughput=100.0,
+                service_url="http://10.0.0.2:8000",
+            ),
+        )
+
+        unscoped = app.analyze_history(history, target_speed=10)
+        scoped = app.analyze_history(
+            history,
+            target_speed=10,
+            service_url="http://127.0.0.1:8000",
+        )
+
+        self.assertEqual(unscoped[0].pairs[0].passing_concurrencies, (1, 2))
+        self.assertEqual(scoped[0].pairs[0].passing_concurrencies, (1,))
+        self.assertEqual(scoped[0].pairs[0].max_concurrency, 1)
+        self.assertEqual(scoped[0].common_max_concurrency, 1)
+
+    def test_analysis_flags_non_monotonic_passing_concurrencies(self):
+        history = (
+            history_record(
+                input_len=128,
+                output_len=8,
+                concurrency=2,
+                throughput=5.0,
+            ),
+            history_record(
+                input_len=128,
+                output_len=8,
+                concurrency=4,
+                throughput=20.0,
+            ),
+        )
+
+        analysis = app.analyze_history(history, target_speed=10)
+        pair = analysis[0].pairs[0]
+        text = app.format_analysis(analysis, target_speed=10)
+
+        self.assertEqual(pair.max_concurrency, 4)
+        self.assertEqual(pair.non_monotonic_concurrencies, (2,))
+        self.assertIn("未达标但更高并发已达标", text)
+
+    def test_analysis_does_not_flag_contiguous_passing_concurrencies(self):
+        history = (
+            history_record(
+                input_len=128,
+                output_len=8,
+                concurrency=1,
+                throughput=20.0,
+            ),
+            history_record(
+                input_len=128,
+                output_len=8,
+                concurrency=2,
+                throughput=15.0,
+            ),
+        )
+
+        pair = app.analyze_history(history, target_speed=10)[0].pairs[0]
+
+        self.assertEqual(pair.non_monotonic_concurrencies, ())
 
 
 def create_fake_vllm(directory, payload, exit_code=0):
@@ -699,6 +854,59 @@ class OrchestrationTests(unittest.TestCase):
             self.assertEqual([row.status for row in rows], ["FAILED", "SUCCESS"])
             self.assertIn("unexpected local failure", rows[0].error)
 
+    def test_run_evaluation_survives_dirty_history_rows(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = make_config(temp_dir)
+            store = app.ResultStore(config)
+            store.append_record(make_record(concurrency=1, throughput=20.0))
+            with config.csv_path.open("a", encoding="utf-8", newline="") as handle:
+                handle.write("\nbroken,row\n")
+
+            runner = FakeRunner(
+                config,
+                [
+                    make_vllm_payload(completed=1, failed=0),
+                    make_vllm_payload(completed=2, failed=0),
+                ],
+            )
+            output = io.StringIO()
+
+            exit_code = app.run_evaluation(
+                config, runner=runner, output_stream=output
+            )
+
+            self.assertEqual(exit_code, 0)
+            self.assertIn("已跳过 1 行", output.getvalue())
+            self.assertIn("历史达标分析", output.getvalue())
+
+    def test_run_evaluation_excludes_history_from_other_service_urls(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = make_config(temp_dir)
+            store = app.ResultStore(config)
+            store.append_record(
+                replace(
+                    make_record(concurrency=2, throughput=100.0),
+                    service_url="http://10.0.0.2:8000",
+                )
+            )
+
+            runner = FakeRunner(
+                config,
+                [
+                    make_vllm_payload(completed=1, failed=0),
+                    make_vllm_payload(completed=2, failed=0),
+                ],
+            )
+            output = io.StringIO()
+
+            exit_code = app.run_evaluation(
+                config, runner=runner, output_stream=output
+            )
+
+            self.assertEqual(exit_code, 0)
+            self.assertIn("其他服务地址", output.getvalue())
+            self.assertIn("无并发达到目标速度", output.getvalue())
+
 
 class CliAndPromptTests(unittest.TestCase):
     def test_build_eval_config_applies_all_defaults(self):
@@ -714,6 +922,7 @@ class CliAndPromptTests(unittest.TestCase):
                 input_lengths="",
                 output_lengths="",
                 concurrencies="",
+                served_model_name="",
                 today=date(2026, 11, 22),
             )
 
@@ -722,12 +931,33 @@ class CliAndPromptTests(unittest.TestCase):
             self.assertEqual(config.output_lengths, app.DEFAULT_OUTPUT_LENGTHS)
             self.assertEqual(config.concurrencies, app.DEFAULT_CONCURRENCIES)
             self.assertEqual(config.model_name, "Qwen-7B")
+            self.assertIsNone(config.served_model_name)
             self.assertEqual(
                 config.result_dir,
                 Path("/data/model_eval_result/20261122/Qwen-7B").resolve(),
             )
 
-    def test_prompt_reprompts_after_invalid_value_and_collects_seven_fields(self):
+    def test_build_eval_config_keeps_served_model_name_override(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_dir = Path(temp_dir) / "Qwen 7B"
+            model_dir.mkdir()
+
+            config = app.build_eval_config(
+                service_url="http://127.0.0.1:8000",
+                model_path=os.fspath(model_dir),
+                result_dir="",
+                target_speed="",
+                input_lengths="",
+                output_lengths="",
+                concurrencies="",
+                served_model_name="  served-qwen  ",
+                today=date(2026, 11, 22),
+            )
+
+            self.assertEqual(config.model_name, "Qwen-7B")
+            self.assertEqual(config.served_model_name, "served-qwen")
+
+    def test_prompt_reprompts_after_invalid_value_and_collects_eight_fields(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             model_dir = Path(temp_dir) / "Qwen 7B"
             model_dir.mkdir()
@@ -735,6 +965,7 @@ class CliAndPromptTests(unittest.TestCase):
                 [
                     "http://127.0.0.1:8000",
                     os.fspath(model_dir),
+                    "served-qwen",
                     temp_dir,
                     "0",
                     "10",
@@ -755,6 +986,7 @@ class CliAndPromptTests(unittest.TestCase):
             self.assertEqual(config.input_lengths, (128, 256))
             self.assertEqual(config.output_lengths, (8, 16))
             self.assertEqual(config.concurrencies, (1, 2))
+            self.assertEqual(config.served_model_name, "served-qwen")
             self.assertIn("必须是正整数", output.getvalue())
 
     def test_prompt_eof_raises_config_error_instead_of_looping(self):
@@ -786,6 +1018,8 @@ class CliAndPromptTests(unittest.TestCase):
 
         self.assertEqual(completed.returncode, 0)
         self.assertIn("模型服务地址", completed.stdout)
+        self.assertIn("模型文件路径", completed.stdout)
+        self.assertIn("服务端模型名", completed.stdout)
         self.assertIn("目标速度", completed.stdout)
         self.assertIn("2048,8192,65536,120000,258000", completed.stdout)
         self.assertIn("1,8,16,32,48,64", completed.stdout)

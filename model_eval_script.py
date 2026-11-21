@@ -76,7 +76,11 @@ class BenchmarkCase:
 
 @dataclass(frozen=True)
 class EvalConfig:
-    """一次批量压测运行所需的完整配置。"""
+    """一次批量压测运行所需的完整配置。
+
+    ``served_model_name`` 非空时作为 ``--model`` 传给 vLLM；为空时使用
+    由模型路径最后一级生成的 ``model_name``。
+    """
 
     endpoint: ServiceEndpoint
     model_path: str
@@ -86,6 +90,7 @@ class EvalConfig:
     input_lengths: Tuple[int, ...]
     output_lengths: Tuple[int, ...]
     concurrencies: Tuple[int, ...]
+    served_model_name: Optional[str] = None
 
     @property
     def csv_path(self) -> Path:
@@ -139,13 +144,18 @@ class BenchmarkRunOutput:
 
 @dataclass(frozen=True)
 class PairAnalysis:
-    """单个输入长度与输出长度组合的达标分析。"""
+    """单个输入长度与输出长度组合的达标分析。
+
+    ``non_monotonic_concurrencies`` 记录已测试但未达标、却低于某个已达标
+    并发的并发数，用于提示最大达标并发可能不代表稳定上限。
+    """
 
     input_len: int
     output_len: int
     passing_concurrencies: Tuple[int, ...]
     max_concurrency: Optional[int]
     has_success: bool
+    non_monotonic_concurrencies: Tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -192,7 +202,9 @@ class ResultStore:
     def validate_existing(self) -> None:
         """校验已有 CSV 的表头和模型路径，防止不兼容或混合数据追加。
 
-        文件不存在或为空时视为可初始化。校验过程只读，不会修改文件。
+        文件不存在或为空时视为可初始化。表头不匹配时拒绝继续；模型路径
+        只对能够完整解析的记录进行比对，无法解析的脏行直接跳过，避免
+        历史脏数据阻断本次执行。校验过程只读，不会修改文件。
         """
 
         self._ensure_directory()
@@ -206,12 +218,18 @@ class ResultStore:
                 raise ConfigError(
                     f"已有 CSV 表头与当前版本不兼容，拒绝覆盖或追加：{path}"
                 )
-            for row_number, row in enumerate(reader, start=2):
-                existing_path = row.get("model_path")
-                if existing_path and existing_path != self.config.model_path:
+            for row in reader:
+                try:
+                    record = self._record_from_row(row)
+                except (KeyError, TypeError, ValueError, csv.Error):
+                    continue
+                if (
+                    record.model_path
+                    and record.model_path != self.config.model_path
+                ):
                     raise ConfigError(
                         "已有 CSV 包含其他模型路径，模型名规范化后发生冲突；"
-                        f"请更换结果目录。文件：{path}，第 {row_number} 行"
+                        f"请更换结果目录。文件：{path}，第 {reader.line_num} 行"
                     )
 
     def append_record(self, record: BenchmarkRecord) -> None:
@@ -244,8 +262,14 @@ class ResultStore:
             handle.flush()
             os.fsync(handle.fileno())
 
-    def load_records(self) -> Tuple[BenchmarkRecord, ...]:
-        """读取并转换当前 CSV 中的全部历史记录。"""
+    def load_records(
+        self, output_stream: Optional[TextIO] = None
+    ) -> Tuple[BenchmarkRecord, ...]:
+        """读取并转换当前 CSV 中的全部历史记录。
+
+        无法解析的历史行（空行、截断行、数值列损坏等）会被跳过并给出
+        提示，绝不因为历史脏数据中断本次执行。
+        """
 
         self.validate_existing()
         path = self.config.csv_path
@@ -253,33 +277,55 @@ class ResultStore:
             return ()
 
         records = []
+        skipped = 0
         with path.open("r", encoding="utf-8", newline="") as handle:
-            for row in csv.DictReader(handle):
-                records.append(
-                    BenchmarkRecord(
-                        run_id=row["run_id"],
-                        timestamp=row["timestamp"],
-                        service_url=row["service_url"],
-                        model_name=row["model_name"],
-                        model_path=row["model_path"],
-                        target_tokens_per_sec=int(row["target_tokens_per_sec"]),
-                        seed=int(row["seed"]),
-                        input_len=int(row["input_len"]),
-                        output_len=int(row["output_len"]),
-                        concurrency=int(row["concurrency"]),
-                        completed=int(row["completed"] or 0),
-                        failed=int(row["failed"] or 0),
-                        output_throughput_tok_s=self._optional_float(
-                            row["output_throughput_tok_s"]
-                        ),
-                        mean_ttft_ms=self._optional_float(row["mean_ttft_ms"]),
-                        mean_tpot_ms=self._optional_float(row["mean_tpot_ms"]),
-                        duration_s=self._optional_float(row["duration_s"]),
-                        status=row["status"],
-                        error=row["error"],
-                    )
-                )
+            reader = csv.DictReader(handle)
+            for row in reader:
+                try:
+                    records.append(self._record_from_row(row))
+                except (KeyError, TypeError, ValueError, csv.Error) as exc:
+                    skipped += 1
+                    if output_stream is not None and skipped <= 5:
+                        output_stream.write(
+                            "跳过无法解析的历史 CSV 行"
+                            f"（第 {reader.line_num} 行）：{exc}\n"
+                        )
+        if skipped and output_stream is not None:
+            output_stream.write(
+                f"已跳过 {skipped} 行无法解析的历史记录，本次执行继续。\n"
+            )
         return tuple(records)
+
+    @staticmethod
+    def _record_from_row(row: dict) -> BenchmarkRecord:
+        """把一行 CSV 字典转换为记录；字段缺失或非法时抛出解析异常。"""
+
+        def text(field: str) -> str:
+            value = row.get(field)
+            return "" if value is None else str(value)
+
+        return BenchmarkRecord(
+            run_id=text("run_id"),
+            timestamp=text("timestamp"),
+            service_url=text("service_url"),
+            model_name=text("model_name"),
+            model_path=text("model_path"),
+            target_tokens_per_sec=int(text("target_tokens_per_sec")),
+            seed=int(text("seed")),
+            input_len=int(text("input_len")),
+            output_len=int(text("output_len")),
+            concurrency=int(text("concurrency")),
+            completed=int(text("completed") or 0),
+            failed=int(text("failed") or 0),
+            output_throughput_tok_s=ResultStore._optional_float(
+                text("output_throughput_tok_s")
+            ),
+            mean_ttft_ms=ResultStore._optional_float(text("mean_ttft_ms")),
+            mean_tpot_ms=ResultStore._optional_float(text("mean_tpot_ms")),
+            duration_s=ResultStore._optional_float(text("duration_s")),
+            status=text("status"),
+            error=text("error"),
+        )
 
     @staticmethod
     def _optional_float(value: str) -> Optional[float]:
@@ -400,7 +446,7 @@ def build_vllm_command(
         "--port",
         str(config.endpoint.port),
         "--model",
-        config.model_name,
+        config.served_model_name or config.model_name,
         "--tokenizer",
         config.model_path,
         "--dataset-name",
@@ -460,6 +506,22 @@ def _payload_float(payload: dict, field: str) -> float:
     return float(value)
 
 
+def _optional_payload_float(payload: dict, field: str) -> Optional[float]:
+    """读取 vLLM JSON 中可选的浮点指标字段。
+
+    字段缺失、为 null、布尔值或无法转换为浮点数时返回 ``None``，不影响
+    记录状态判定。
+    """
+
+    value = payload.get(field)
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def make_record_from_result(
     payload: dict,
     config: EvalConfig,
@@ -469,8 +531,10 @@ def make_record_from_result(
 ) -> BenchmarkRecord:
     """把 vLLM 结果 JSON 转换为 CSV 记录并判定完整、部分或失败状态。
 
-    只有完成请求数等于当前并发数、失败数为零且三项指标齐全时，记录才是
-    ``SUCCESS``。部分完成记录保留可用的统计值，但不会进入达标汇总。
+    只有完成请求数等于当前并发数、失败数为零且输出吞吐可用时，记录才是
+    ``SUCCESS``。``mean_ttft_ms``、``mean_tpot_ms`` 和 ``duration`` 属于可选
+    指标，缺失时以空值记录，不影响状态判定。部分完成记录保留可用的统计
+    值，但不会进入达标汇总。
     """
 
     completed = 0
@@ -479,9 +543,6 @@ def make_record_from_result(
         completed = _payload_int(payload, "completed")
         failed = _payload_int(payload, "failed")
         output_throughput = _payload_float(payload, "output_throughput")
-        mean_ttft_ms = _payload_float(payload, "mean_ttft_ms")
-        mean_tpot_ms = _payload_float(payload, "mean_tpot_ms")
-        duration_s = _payload_float(payload, "duration")
     except (TypeError, ValueError) as exc:
         missing_field = str(exc) or "必需指标"
         return make_failed_record(
@@ -493,6 +554,10 @@ def make_record_from_result(
             completed=completed,
             failed=failed,
         )
+
+    mean_ttft_ms = _optional_payload_float(payload, "mean_ttft_ms")
+    mean_tpot_ms = _optional_payload_float(payload, "mean_tpot_ms")
+    duration_s = _optional_payload_float(payload, "duration")
 
     if completed == case.concurrency and failed == 0:
         status = "SUCCESS"
@@ -568,21 +633,33 @@ def make_failed_record(
 
 
 def analyze_history(
-    records: Sequence[BenchmarkRecord], target_speed: int
+    records: Sequence[BenchmarkRecord],
+    target_speed: int,
+    service_url: Optional[str] = None,
 ) -> Tuple[InputAnalysis, ...]:
     """按当前目标速度分析全部历史记录。
 
-    同一输入/输出/并发组合只保留最后追加的 ``SUCCESS`` 记录。每个输入
-    长度先计算各输出长度的最大达标并发，再计算所有输出长度共同达标的
-    最大公共并发。
+    指定 ``service_url`` 时只统计该服务地址的记录，避免把不同实例的
+    结果混在一起。同一输入/输出/并发组合只保留最后追加的 ``SUCCESS``
+    记录。每个输入长度先计算各输出长度的最大达标并发，再计算所有输出
+    长度共同达标的最大公共并发。
     """
+
+    if service_url is not None:
+        records = [
+            record for record in records if record.service_url == service_url
+        ]
 
     input_values = sorted({record.input_len for record in records})
     latest_success = {}
     output_values = {}
+    tested_values = {}
 
     for record in records:
         output_values.setdefault(record.input_len, set()).add(record.output_len)
+        tested_values.setdefault(
+            (record.input_len, record.output_len), set()
+        ).add(record.concurrency)
         if (
             record.status == "SUCCESS"
             and record.output_throughput_tok_s is not None
@@ -608,13 +685,28 @@ def analyze_history(
                     }
                 )
             )
+            max_concurrency = passing[-1] if passing else None
+            non_monotonic: Tuple[int, ...] = ()
+            if max_concurrency is not None:
+                passing_set = set(passing)
+                non_monotonic = tuple(
+                    sorted(
+                        concurrency
+                        for concurrency in tested_values.get(
+                            (input_len, output_len), set()
+                        )
+                        if concurrency < max_concurrency
+                        and concurrency not in passing_set
+                    )
+                )
             pair_analyses.append(
                 PairAnalysis(
                     input_len=input_len,
                     output_len=output_len,
                     passing_concurrencies=passing,
-                    max_concurrency=passing[-1] if passing else None,
+                    max_concurrency=max_concurrency,
                     has_success=bool(success_rows),
+                    non_monotonic_concurrencies=non_monotonic,
                 )
             )
 
@@ -672,6 +764,15 @@ def format_analysis(
                 )
                 lines.append(f"    达标并发：{concurrencies}")
                 lines.append(f"    最大达标并发：{pair.max_concurrency}")
+                if pair.non_monotonic_concurrencies:
+                    failed_values = ", ".join(
+                        str(value)
+                        for value in pair.non_monotonic_concurrencies
+                    )
+                    lines.append(
+                        f"    注意：并发 {failed_values} 未达标但更高并发已达标，"
+                        "最大达标并发仅供参考"
+                    )
 
         if input_entry.common_max_concurrency is not None:
             lines.append(
@@ -690,8 +791,9 @@ def run_evaluation(
 ) -> int:
     """执行全部压测组合、追加结果并打印当前 CSV 的历史分析。
 
-    返回值 0 表示本次所有组合完整成功；2 表示存在失败或部分成功；
-    用户中断返回 130。目标速度是否达到本身不作为进程失败。
+    历史分析只统计与本次服务地址相同的记录。返回值 0 表示本次所有组合
+    完整成功；2 表示存在失败或部分成功；用户中断返回 130。目标速度是否
+    达到本身不作为进程失败。
     """
 
     stream = output_stream or sys.stdout
@@ -772,10 +874,25 @@ def run_evaluation(
         current_statuses.append(record.status)
 
     stream.write("\n")
-    history = store.load_records()
+    history = store.load_records(output_stream=stream)
+    other_service_count = sum(
+        1
+        for record in history
+        if record.service_url != config.endpoint.base_url
+    )
+    if other_service_count:
+        stream.write(
+            f"注意：有 {other_service_count} 条历史记录来自其他服务地址，"
+            "未纳入本次分析。\n"
+        )
     stream.write(
         format_analysis(
-            analyze_history(history, config.target_speed), config.target_speed
+            analyze_history(
+                history,
+                config.target_speed,
+                service_url=config.endpoint.base_url,
+            ),
+            config.target_speed,
         )
     )
     stream.write("\n")
@@ -791,11 +908,12 @@ def run_evaluation(
 def parse_positive_int(value: str, field_name: str) -> int:
     """把字符串解析为严格的正整数，并返回解析结果。
 
-    只接受十进制数字，拒绝零、负数、小数、符号和空字符串。
+    只接受 ASCII 十进制数字，拒绝零、负数、小数、符号、Unicode 数字
+    和空字符串。
     """
 
     raw = value.strip()
-    if not raw or not raw.isdigit():
+    if not re.fullmatch(r"[0-9]+", raw):
         raise ConfigError(f"{field_name}必须是正整数，当前输入为：{value!r}")
     parsed = int(raw)
     if parsed <= 0:
@@ -848,7 +966,7 @@ def parse_service_url(service_url: str) -> ServiceEndpoint:
 
     try:
         host = parsed.hostname
-        port = parsed.port or 80
+        port = 80 if parsed.port is None else parsed.port
     except ValueError as exc:
         raise ConfigError(f"模型服务地址的端口不合法：{exc}") from exc
 
@@ -920,9 +1038,10 @@ def build_eval_config(
     input_lengths: str,
     output_lengths: str,
     concurrencies: str,
+    served_model_name: str = "",
     today: Optional[date] = None,
 ) -> EvalConfig:
-    """校验七项原始输入并构造不可变运行配置。"""
+    """校验八项原始输入并构造不可变运行配置。"""
 
     endpoint = parse_service_url(service_url)
     normalized_model_path = validate_model_path(model_path)
@@ -953,6 +1072,7 @@ def build_eval_config(
         input_lengths=parsed_inputs,
         output_lengths=parsed_outputs,
         concurrencies=parsed_concurrencies,
+        served_model_name=served_model_name.strip() or None,
     )
 
 
@@ -990,31 +1110,37 @@ def prompt_for_config(
     output_stream: Optional[TextIO] = None,
     today: Optional[date] = None,
 ) -> EvalConfig:
-    """按固定顺序交互读取七项参数，并逐项校验后构造配置。"""
+    """按固定顺序交互读取八项参数，并逐项校验后构造配置。"""
 
     reader = input_func or input
     stream = output_stream or sys.stdout
     service_url = _read_with_retry(
         reader,
-        "[1/7] 模型服务地址（必填，如 http://127.0.0.1:8000）：",
+        "[1/8] 模型服务地址（必填，如 http://127.0.0.1:8000）：",
         parse_service_url,
         stream,
     )
     model_path = _read_with_retry(
         reader,
-        "[2/7] 模型文件绝对路径（必填，必须以 / 开头且存在）：",
+        "[2/8] 模型文件绝对路径（必填，必须以 / 开头且存在）：",
         validate_model_path,
+        stream,
+    )
+    served_model_name = _read_with_retry(
+        reader,
+        "[3/8] 服务端模型名（可留空，默认使用模型文件路径最后一级的名称）：",
+        lambda value: value.strip(),
         stream,
     )
     result_dir = _read_with_retry(
         reader,
-        "[3/7] 结果目录（可留空使用默认目录）：",
+        "[4/8] 结果目录（可留空使用默认目录）：",
         lambda value: value.strip(),
         stream,
     )
     target_speed = _read_with_retry(
         reader,
-        f"[4/7] 目标速度 tokens/s（可留空，默认 {DEFAULT_TARGET_SPEED}）：",
+        f"[5/8] 目标速度 tokens/s（可留空，默认 {DEFAULT_TARGET_SPEED}）：",
         lambda value: (
             parse_positive_int(value, "目标速度")
             if value.strip()
@@ -1024,7 +1150,7 @@ def prompt_for_config(
     )
     input_lengths = _read_with_retry(
         reader,
-        "[5/7] 输入长度列表（逗号或空格分隔，可留空，"
+        "[6/8] 输入长度列表（逗号或空格分隔，可留空，"
         f"默认 {','.join(map(str, DEFAULT_INPUT_LENGTHS))}）：",
         lambda value: parse_positive_int_list(
             value, DEFAULT_INPUT_LENGTHS, "输入长度列表"
@@ -1033,7 +1159,7 @@ def prompt_for_config(
     )
     output_lengths = _read_with_retry(
         reader,
-        "[6/7] 输出长度列表（逗号或空格分隔，可留空，"
+        "[7/8] 输出长度列表（逗号或空格分隔，可留空，"
         f"默认 {','.join(map(str, DEFAULT_OUTPUT_LENGTHS))}）：",
         lambda value: parse_positive_int_list(
             value, DEFAULT_OUTPUT_LENGTHS, "输出长度列表"
@@ -1042,7 +1168,7 @@ def prompt_for_config(
     )
     concurrencies = _read_with_retry(
         reader,
-        "[7/7] 并发数列表（逗号或空格分隔，可留空，"
+        "[8/8] 并发数列表（逗号或空格分隔，可留空，"
         f"默认 {','.join(map(str, DEFAULT_CONCURRENCIES))}）：",
         lambda value: parse_positive_int_list(
             value, DEFAULT_CONCURRENCIES, "并发数列表"
@@ -1060,6 +1186,7 @@ def prompt_for_config(
         input_lengths=input_lengths,
         output_lengths=output_lengths,
         concurrencies=concurrencies,
+        served_model_name=served_model_name or None,
     )
 
 
@@ -1072,24 +1199,27 @@ def _help_text() -> str:
   python3 model_eval_script.py
   python3 model_eval_script.py --help
 
-七项交互参数：
+八项交互参数：
   1. 模型服务地址：必填，格式 http://host[:port]，不能带路径或认证信息。
   2. 模型文件路径：必填，必须是有 / 开头的本机绝对路径且真实存在。
-  3. 结果目录：可留空；默认
+  3. 服务端模型名：可留空；非空时作为 --model 传给 vLLM，留空时使用
+     模型文件路径最后一级规范化后的名称。
+  4. 结果目录：可留空；默认
      /data/model_eval_result/<今日日期YYYYMMDD>/<模型名>/
-  4. 目标速度：正整数 tokens/s，默认 {DEFAULT_TARGET_SPEED}。
-  5. 输入长度列表：英文逗号或空白分隔的正整数，默认
+  5. 目标速度：正整数 tokens/s，默认 {DEFAULT_TARGET_SPEED}。
+  6. 输入长度列表：英文逗号或空白分隔的正整数，默认
      {','.join(map(str, DEFAULT_INPUT_LENGTHS))}
-  6. 输出长度列表：英文逗号或空白分隔的正整数，默认
+  7. 输出长度列表：英文逗号或空白分隔的正整数，默认
      {','.join(map(str, DEFAULT_OUTPUT_LENGTHS))}
-  7. 并发数列表：英文逗号或空白分隔的正整数，默认
+  8. 并发数列表：英文逗号或空白分隔的正整数，默认
      {','.join(map(str, DEFAULT_CONCURRENCIES))}
 
 输出契约：
   - <结果目录>/<模型名>.csv：追加式结构化汇总，绝不覆盖已有结果。
   - <结果目录>/<模型名>.vllm_raw.jsonl：追加式 vLLM 原始明细。
   - 模型名取路径最后一级，只保留字母、数字、下划线和连字符。
-  - 所有历史 SUCCESS 记录按本次目标速度重新判断达标情况。
+  - 所有历史 SUCCESS 记录按本次目标速度重新判断达标情况；仅统计与本次
+    服务地址相同的历史记录，其他地址的记录会提示后排除。
 
 前置条件：
   - Python 3.9+。
@@ -1105,14 +1235,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         python3 model_eval_script.py
         python3 model_eval_script.py --help
 
-    七项交互参数及默认值：
+    八项交互参数及默认值：
         1. 模型服务地址：必填，http://host[:port]。
         2. 模型文件路径：必填，存在的本机绝对路径。
-        3. 结果目录：可留空，默认按日期和模型名生成。
-        4. 目标速度：可留空，默认 10 tokens/s。
-        5. 输入长度列表：可留空，默认 2048,8192,65536,120000,258000。
-        6. 输出长度列表：可留空，默认 2048。
-        7. 并发数列表：可留空，默认 1,8,16,32,48,64。
+        3. 服务端模型名：可留空，默认取模型文件路径最后一级。
+        4. 结果目录：可留空，默认按日期和模型名生成。
+        5. 目标速度：可留空，默认 10 tokens/s。
+        6. 输入长度列表：可留空，默认 2048,8192,65536,120000,258000。
+        7. 输出长度列表：可留空，默认 2048。
+        8. 并发数列表：可留空，默认 1,8,16,32,48,64。
 
     无参数时进入交互模式；``--help`` 只打印帮助，不创建目录、不执行压测。
     """
